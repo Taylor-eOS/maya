@@ -64,15 +64,17 @@ class AudioGenerator:
             ])
         return [l1, l2, l3]
 
-    def generate_audio(self, text, speaker_description):
+    def generate_audio(self, text, speaker_description, max_new_tokens=2048):
         prompt = self.build_prompt(speaker_description, text)
         inputs = self.tokenizer(prompt, return_tensors="pt")
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        input_len = inputs['input_ids'].shape[1]
+        safe_max = min(max_new_tokens, 131072 - input_len - 100)
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=2048,
+                max_new_tokens=safe_max,
                 min_new_tokens=28,
                 temperature=0.4,
                 top_p=0.9,
@@ -81,7 +83,7 @@ class AudioGenerator:
                 eos_token_id=CODE_END_TOKEN_ID,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
-        generated_ids = outputs[0, inputs['input_ids'].shape[1]:].tolist()
+        generated_ids = outputs[0, input_len:].tolist()
         snac_tokens = self.extract_snac_codes(generated_ids)
         if len(snac_tokens) < 7:
             raise ValueError("Not enough SNAC tokens generated for audio")
