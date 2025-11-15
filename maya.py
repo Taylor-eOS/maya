@@ -19,11 +19,24 @@ TEXT_EOT_ID = 128009
 class AudioGenerator:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = AutoModelForCausalLM.from_pretrained("maya-research/maya1", torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
-        self.tokenizer = AutoTokenizer.from_pretrained("maya-research/maya1", trust_remote_code=True)
-        self.snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
-        if torch.cuda.is_available():
-            self.snac_model = self.snac_model.to(self.device)
+        print(f"Using device: {self.device}")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "maya-research/maya1", 
+            torch_dtype=torch.bfloat16, 
+            device_map="auto", 
+            trust_remote_code=True
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "maya-research/maya1", 
+            trust_remote_code=True
+        )
+        try:
+            self.snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
+            if torch.cuda.is_available():
+                self.snac_model = self.snac_model.to(self.device)
+        except Exception as e:
+            print(f"Error loading SNAC model: {e}")
+            raise
 
     def build_prompt(self, description, text):
         soh_token = self.tokenizer.decode([SOH_ID])
@@ -45,6 +58,8 @@ class AudioGenerator:
         return snac_codes
 
     def unpack_snac_from_7(self, snac_tokens):
+        if not snac_tokens:
+            return [[], [], []]
         if snac_tokens and snac_tokens[-1] == CODE_END_TOKEN_ID:
             snac_tokens = snac_tokens[:-1]
         frames = len(snac_tokens) // SNAC_TOKENS_PER_FRAME
@@ -64,13 +79,15 @@ class AudioGenerator:
             ])
         return [l1, l2, l3]
 
-    def generate_audio(self, text, speaker_description, max_new_tokens=2048):
+    def generate_audio(self, text, speaker_description, max_new_tokens=16384):
         prompt = self.build_prompt(speaker_description, text)
         inputs = self.tokenizer(prompt, return_tensors="pt")
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_len = inputs['input_ids'].shape[1]
         safe_max = min(max_new_tokens, 131072 - input_len - 100)
+        print(f"Generating audio for {len(text)} characters, {len(text.split())} words")
+        print(f"Input tokens: {input_len}, Max new tokens: {safe_max}")
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
@@ -85,25 +102,26 @@ class AudioGenerator:
             )
         generated_ids = outputs[0, input_len:].tolist()
         snac_tokens = self.extract_snac_codes(generated_ids)
+        print(f"Generated {len(snac_tokens)} SNAC tokens")
         if len(snac_tokens) < 7:
-            raise ValueError("Not enough SNAC tokens generated for audio")
+            raise ValueError(f"Not enough SNAC tokens generated for audio: {len(snac_tokens)}")
         levels = self.unpack_snac_from_7(snac_tokens)
         codes_tensor = [torch.tensor(level, dtype=torch.long, device=self.device).unsqueeze(0) for level in levels]
         with torch.inference_mode():
             z_q = self.snac_model.quantizer.from_codes(codes_tensor)
             audio = self.snac_model.decoder(z_q)[0, 0].cpu().numpy()
         if len(audio) > 2048:
-            audio = audio[2048:]
+            audio_abs = np.abs(audio)
+            threshold = np.max(audio_abs) * 0.01  
+            start_idx = np.where(audio_abs > threshold)[0]
+            if len(start_idx) > 0:
+                start_idx = max(0, start_idx[0] - 512)  
+                audio = audio[start_idx:]
+            else:
+                audio = audio[2048:]  
+        print(f"Generated audio length: {len(audio)} samples ({len(audio)/24000:.2f} seconds)")
         return audio
 
     def save_audio(self, audio, output_file, sample_rate=24000):
         sf.write(output_file, audio, sample_rate)
-
-if __name__ == "__main__":
-    generator = AudioGenerator()
-    text = "Frodo and Sam walk to Mordor to return the ring."
-    speaker_description = "Professional british male audiobook narrator."
-    audio = generator.generate_audio(text, speaker_description)
-    generator.save_audio(audio, "output.wav")
-    print("Audio saved to output.wav")
 

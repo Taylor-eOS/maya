@@ -1,81 +1,59 @@
+import os
 import torch
 import numpy as np
-import os
 from pysbd import Segmenter
 from maya import AudioGenerator
+import soundfile as sf
+
+def split_text_into_chunks(text, max_words=100, min_tail_ratio=0.5, segmenter=None):
+    if not text or text.strip() == "":
+        return []
+    if segmenter is None:
+        sentences = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
+    else:
+        sentences = segmenter.segment(text)
+    sent_words = [len(s.split()) for s in sentences]
+    chunks = []
+    curr = []
+    curr_words = 0
+    for s, w in zip(sentences, sent_words):
+        if w > max_words:
+            words = s.split()
+            i = 0
+            while i < len(words):
+                take = min(max_words, len(words) - i)
+                chunk = " ".join(words[i:i+take])
+                chunks.append(chunk)
+                i += take
+            continue
+        if curr_words + w > max_words:
+            if curr:
+                chunks.append(" ".join(curr))
+            curr = [s]
+            curr_words = w
+        else:
+            curr.append(s)
+            curr_words += w
+    if curr:
+        chunks.append(" ".join(curr))
+    if len(chunks) >= 2:
+        last_words = len(chunks[-1].split())
+        prev_words = len(chunks[-2].split())
+        can_merge_without_exceed = (prev_words + last_words) <= max_words
+        tail_too_small = last_words < max(1, int(max_words * min_tail_ratio))
+        if tail_too_small and can_merge_without_exceed:
+            chunks[-2] = chunks[-2] + " " + chunks[-1]
+            chunks.pop(-1)
+    return chunks
 
 gen = AudioGenerator()
 segmenter = Segmenter(language="en", clean=False)
 speaker_description = "Realistic male audiobook narrator in the 50s age with british accent. Normal pitch, warm timbre, friendly tone, reading pacing, good pronounciation."
 fixed_seed = 42
-max_input_tokens = 1024
 max_new_tokens = 16384
 sample_rate = 24000
 output_dir = "."
 os.makedirs(output_dir, exist_ok=True)
-
-desc_prompt = gen.build_prompt(speaker_description, "")
-desc_inputs = gen.tokenizer(desc_prompt, return_tensors="pt")
-desc_tokens = desc_inputs["input_ids"].shape[1]
-
-def split_and_generate(text, speaker_description, max_tokens, fixed_seed, gen, segmenter, desc_tokens):
-    if not text.strip():
-        return []
-    prompt = gen.build_prompt(speaker_description, text)
-    inputs = gen.tokenizer(prompt, return_tensors="pt")
-    token_count = inputs["input_ids"].shape[1]
-    if token_count <= max_tokens:
-        torch.manual_seed(fixed_seed)
-        try:
-            audio = gen.generate_audio(text, speaker_description, max_new_tokens)
-            return [audio]
-        except ValueError as e:
-            print(f"Error generating audio for text: {e}")
-            return []
-    sentences = segmenter.segment(text)
-    if len(sentences) <= 1:
-        words = text.split()
-        subchunks = []
-        current_subchunk = []
-        for word in words:
-            temp_subchunk = current_subchunk + [word]
-            temp_text = " ".join(temp_subchunk)
-            sub_prompt = gen.build_prompt(speaker_description, temp_text)
-            sub_inputs = gen.tokenizer(sub_prompt, return_tensors="pt")
-            sub_token_count = sub_inputs["input_ids"].shape[1]
-            if sub_token_count > max_tokens:
-                if current_subchunk:
-                    subchunks.append(" ".join(current_subchunk))
-                current_subchunk = [word]
-            else:
-                current_subchunk = temp_subchunk
-        if current_subchunk:
-            subchunks.append(" ".join(current_subchunk))
-        audios = []
-        for subchunk_text in subchunks:
-            torch.manual_seed(fixed_seed)
-            try:
-                sub_audio = gen.generate_audio(subchunk_text, speaker_description, max_new_tokens)
-                audios.append(sub_audio)
-            except ValueError as e:
-                print(f"Error generating subchunk: {e}")
-        return audios
-    var_tokens_per_sent = []
-    for sentence in sentences:
-        sent_prompt = gen.build_prompt(speaker_description, sentence)
-        sent_inputs = gen.tokenizer(sent_prompt, return_tensors="pt")
-        full_sent_tokens = sent_inputs["input_ids"].shape[1]
-        var_token = full_sent_tokens - desc_tokens
-        var_tokens_per_sent.append(var_token)
-    cum_var = np.cumsum(var_tokens_per_sent)
-    total_var = cum_var[-1]
-    half_var = total_var / 2.0
-    split_idx = np.argmin(np.abs(cum_var - half_var))
-    text1 = " ".join(sentences[:split_idx + 1])
-    text2 = " ".join(sentences[split_idx + 1 :])
-    audios1 = split_and_generate(text1, speaker_description, max_tokens, fixed_seed, gen, segmenter, desc_tokens)
-    audios2 = split_and_generate(text2, speaker_description, max_tokens, fixed_seed, gen, segmenter, desc_tokens)
-    return audios1 + audios2
 
 with open("input.txt", "r", encoding="utf-8") as f:
     full_text = f.read()
@@ -83,12 +61,39 @@ with open("input.txt", "r", encoding="utf-8") as f:
 sections = [section.strip() for section in full_text.split("\n\n") if section.strip()]
 
 for section_index, section in enumerate(sections):
+    print(f"Processing section {section_index + 1}/{len(sections)}")
     full_text_for_check = " ".join(section.splitlines())
-    audio_segments = split_and_generate(full_text_for_check, speaker_description, max_input_tokens, fixed_seed, gen, segmenter, desc_tokens)
+    word_count = len(full_text_for_check.split())
+    print(f"Section has {word_count} words")
+    chunks = split_text_into_chunks(full_text_for_check, max_words=100, min_tail_ratio=0.5, segmenter=segmenter)
+    print(f"Split into {len(chunks)} chunks")
+    audio_segments = []
+    for idx, chunk in enumerate(chunks):
+        print(f"Generating chunk {idx+1}/{len(chunks)}: {len(chunk.split())} words")
+        torch.manual_seed(fixed_seed + idx)
+        try:
+            audio = gen.generate_audio(chunk, speaker_description, max_new_tokens)
+            audio_segments.append(audio)
+        except Exception as e:
+            print(f"Error generating audio for chunk {idx+1}: {e}")
+            words = chunk.split()
+            if len(words) > 90:
+                fallback_chunk = " ".join(words[:90])
+                try:
+                    torch.manual_seed(fixed_seed + idx)
+                    audio = gen.generate_audio(fallback_chunk, speaker_description, max_new_tokens)
+                    audio_segments.append(audio)
+                    print(f"Fallback succeeded for chunk {idx+1}")
+                except Exception as e2:
+                    print(f"Fallback failed for chunk {idx+1}: {e2}")
+            else:
+                print(f"No fallback available for chunk {idx+1}")
     if audio_segments:
         full_audio = np.concatenate(audio_segments)
         output_file = os.path.join(output_dir, f"output_{section_index + 1}.wav")
-        gen.save_audio(full_audio, output_file, sample_rate)
+        sf.write(output_file, full_audio, sample_rate)
         print(f"Saved audio for section {section_index + 1} to {output_file}")
+        print(f"Generated {len(audio_segments)} audio segments")
     else:
         print(f"No audio generated for section {section_index + 1}")
+
