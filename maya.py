@@ -125,3 +125,11 @@ class AudioGenerator:
     def save_audio(self, audio, output_file, sample_rate=24000):
         sf.write(output_file, audio, sample_rate)
 
+if __name__ == "__main__":
+    generator = AudioGenerator()
+    text = "Frodo and Sam walk to Mordor to return the ring."
+    speaker_description = "Professional british male audiobook narrator."
+    audio = generator.generate_audio(text, speaker_description)
+    generator.save_audio(audio, "output.wav")
+    print("Audio saved to output.wav")
+

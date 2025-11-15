@@ -70,7 +70,7 @@ for section_index, section in enumerate(sections):
     audio_segments = []
     for idx, chunk in enumerate(chunks):
         print(f"Generating chunk {idx+1}/{len(chunks)}: {len(chunk.split())} words")
-        torch.manual_seed(fixed_seed + idx)
+        torch.manual_seed(fixed_seed)
         try:
             audio = gen.generate_audio(chunk, speaker_description, max_new_tokens)
             audio_segments.append(audio)
@@ -80,7 +80,7 @@ for section_index, section in enumerate(sections):
             if len(words) > 90:
                 fallback_chunk = " ".join(words[:90])
                 try:
-                    torch.manual_seed(fixed_seed + idx)
+                    torch.manual_seed(fixed_seed)
                     audio = gen.generate_audio(fallback_chunk, speaker_description, max_new_tokens)
                     audio_segments.append(audio)
                     print(f"Fallback succeeded for chunk {idx+1}")
