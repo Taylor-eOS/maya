@@ -1,20 +1,30 @@
+import re
+import os
 import torch
+from pathlib import Path
+import soundfile as sf
+from pydub import AudioSegment
+import pysbd
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from snac import SNAC
-import soundfile as sf
-import numpy as np
 
-CODE_START_TOKEN_ID = 128257
-CODE_END_TOKEN_ID = 128258
-CODE_TOKEN_OFFSET = 128266
-SNAC_MIN_ID = 128266
-SNAC_MAX_ID = 156937
-SNAC_TOKENS_PER_FRAME = 7
+input_file = "input.txt"
+output_dir = "."
+test_mode_on = False
+log_file = "log.txt"
+max_sentences_per_audio_file = 120
+speaker_description = "Professional audiobook narrator, a native German that speaks good english with no accent, calm and pleasant, clear pronounciation."
+
 SOH_ID = 128259
 EOH_ID = 128260
 SOA_ID = 128261
-BOS_ID = 128000
+CODE_START_TOKEN_ID = 128257
 TEXT_EOT_ID = 128009
+CODE_END_TOKEN_ID = 128258
+SNAC_MIN_ID = 128266
+SNAC_MAX_ID = 156937
+CODE_TOKEN_OFFSET = 128266
+SNAC_TOKENS_PER_FRAME = 7
 
 class AudioGenerator:
     def __init__(self):
@@ -92,16 +102,65 @@ class AudioGenerator:
             audio = self.snac_model.decoder(z_q)[0, 0].cpu().numpy()
         if len(audio) > 2048:
             audio = audio[2048:]
+        else:
+            audio = audio[2048:len(audio)]
         return audio
 
     def save_audio(self, audio, output_file, sample_rate=24000):
         sf.write(output_file, audio, sample_rate)
 
-if __name__ == "__main__":
+def split_into_chapters(text):
+    parts = re.split(r'\n\s*\n+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+def split_chapter_sentences(chap, max_sentences=max_sentences_per_audio_file):
+    paragraph_placeholder = "||PARAGRAPH||"
+    paragraph_breaks = re.split(r'(\n{2,})', chap)
+    segmenter = pysbd.Segmenter(language="en", clean=True)
+    elements = []
+    for part in paragraph_breaks:
+        if not part:
+            continue
+        if re.match(r'\n{2,}', part):
+            elements.append(paragraph_placeholder)
+        else:
+            elements.extend(segmenter.segment(part.strip()))
+    processed = []
+    for el in elements:
+        if el == paragraph_placeholder:
+            processed.append("\n\n")
+        else:
+            processed.append(el + "\n\n")
+    chunks = [processed[i:i+max_sentences] for i in range(0, len(processed), max_sentences)]
+    if len(chunks) > 1:
+        a, b = chunks[-2], chunks[-1]
+        combined = a + b
+        half = len(combined) // 2
+        chunks[-2], chunks[-1] = combined[:half], combined[half:]
+    return ["".join(chunk).strip() for chunk in chunks]
+
+def main():
+    text = Path(input_file).read_text(encoding='utf-8')
+    chapters = split_into_chapters(text)
+    idx = 1
     generator = AudioGenerator()
-    text = "Frodo and Sam walk to Mordor to return the ring."
-    speaker_description = "Professional british male audiobook narrator."
-    audio = generator.generate_audio(text, speaker_description)
-    generator.save_audio(audio, "output.wav")
-    print("Audio saved to output.wav")
+    for chap in chapters:
+        for chunk in split_chapter_sentences(chap):
+            if test_mode_on:
+                with open(log_file, "a") as f:
+                    f.write(f"Chunk {idx}: {chunk}\n\n")
+            else:
+                wav_path = os.path.join(output_dir, f"chunk_{idx}.wav")
+                audio = generator.generate_audio(chunk, speaker_description)
+                generator.save_audio(audio, wav_path)
+                mp3_path = os.path.join(output_dir, f"chunk_{idx}.mp3")
+                AudioSegment.from_wav(wav_path).export(mp3_path, format='mp3')
+                try:
+                    os.remove(wav_path)
+                except FileNotFoundError:
+                    print(f"Error removing wav file: {wav_path}")
+            idx += 1
+
+if __name__ == "__main__":
+    main()
 
