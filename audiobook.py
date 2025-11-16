@@ -5,13 +5,15 @@ from pysbd import Segmenter
 from maya import AudioGenerator
 import soundfile as sf
 
-speaker_description = "A male audiobook narrator in a warm, mid-range voice with a subtle continental European lilt, that sounds like he is reading from a history book, maintaining smooth pacing and pausing only after full thoughts for natural flow."
+speaker_description = "A steady male voice reading a history audiobook, pitched in the comfortable mid range around 150 hertz, with a gentle warmth from soft rounded vowels and even breath support, carrying a faint neutral European inflection like a calm professor from Copenhagen, speaking at a measured 140 words per minute, rising slightly for emphasis on key ideas but never rushing, and holding brief natural pauses only at the end of complete sentences to let thoughts settle before the next, content and happy to share."
 fixed_seed = 42
 pause_duration = 0.4
 max_new_tokens = 8192
 sample_rate = 24000
 pause_length = int(pause_duration * sample_rate)
 pause_silence = np.zeros(pause_length, dtype=np.float32)
+fade_duration = 0.05
+fade_length = int(fade_duration * sample_rate)
 output_dir = "."
 input_file = "input.txt"
 max_words_per_chunk = 80
@@ -37,6 +39,16 @@ def split_text_into_chunks(text, max_words=80, segmenter=None):
                 i += take
     return chunks
 
+def apply_fade(audio, fade_length):
+    if len(audio) <= 2 * fade_length:
+        return audio
+    fade_out = np.linspace(1.0, 0.0, fade_length)
+    fade_in = np.linspace(0.0, 1.0, fade_length)
+    faded = audio.copy()
+    faded[:fade_length] *= fade_in
+    faded[-fade_length:] *= fade_out
+    return faded
+
 def main():
     with open(input_file, "r", encoding="utf-8") as f:
         full_text = f.read()
@@ -54,11 +66,12 @@ def main():
             torch.manual_seed(fixed_seed)
             try:
                 audio = gen.generate_audio(chunk, speaker_description, max_new_tokens)
-                audio_segments.append(audio)
+                faded_audio = apply_fade(audio, fade_length)
+                audio_segments.append(faded_audio)
             except Exception as e:
                 print(f"Error generating audio for chunk {idx+1}: {e}")
         if audio_segments:
-            paused_segments = [pause_silence, audio_segments[0]]
+            paused_segments = [audio_segments[0]]
             for seg in audio_segments[1:]:
                 paused_segments.append(pause_silence)
                 paused_segments.append(seg)
@@ -72,4 +85,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

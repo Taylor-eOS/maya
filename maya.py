@@ -4,6 +4,9 @@ from snac import SNAC
 import soundfile as sf
 import numpy as np
 
+TEMPERATURE = 0.1
+TOP_P = 1.0
+REPETITION_PENALTY = 1.0
 CODE_START_TOKEN_ID = 128257
 CODE_END_TOKEN_ID = 128258
 CODE_TOKEN_OFFSET = 128266
@@ -93,9 +96,9 @@ class AudioGenerator:
                 **inputs,
                 max_new_tokens=safe_max,
                 min_new_tokens=28,
-                temperature=0.4,
-                top_p=0.9,
-                repetition_penalty=1.1,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                repetition_penalty=REPETITION_PENALTY,
                 do_sample=True,
                 eos_token_id=CODE_END_TOKEN_ID,
                 pad_token_id=self.tokenizer.pad_token_id,
