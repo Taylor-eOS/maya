@@ -115,15 +115,19 @@ class AudioGenerator:
         with torch.inference_mode():
             z_q = self.snac_model.quantizer.from_codes(codes_tensor)
             audio = self.snac_model.decoder(z_q)[0, 0].cpu().numpy()
+        audio_abs = np.abs(audio)
+        threshold = np.max(audio_abs) * 0.01
         if len(audio) > 2048:
-            audio_abs = np.abs(audio)
-            threshold = np.max(audio_abs) * 0.01  
             start_idx = np.where(audio_abs > threshold)[0]
             if len(start_idx) > 0:
-                start_idx = max(0, start_idx[0] - 512)  
+                start_idx = max(0, start_idx[0] - 512)
                 audio = audio[start_idx:]
             else:
-                audio = audio[2048:]  
+                audio = audio[2048:]
+        end_idx = np.where(audio_abs > threshold)[0]
+        if len(end_idx) > 0:
+            end_idx = min(len(audio) - 1, end_idx[-1] + 512)
+            audio = audio[:end_idx + 1]
         print(f"Generated audio length: {len(audio)} samples ({len(audio)/24000:.2f} seconds)")
         return audio
 
