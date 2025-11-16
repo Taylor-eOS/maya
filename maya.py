@@ -88,9 +88,11 @@ class AudioGenerator:
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_len = inputs['input_ids'].shape[1]
-        safe_max = min(max_new_tokens, 131072 - input_len - 100)
-        print(f"Generating audio for {len(text)} characters, {len(text.split())} words")
-        print(f"Input tokens: {input_len}, Max new tokens: {safe_max}")
+        word_count = len(text.split())
+        estimated_tokens = int(1.5 * 30 * word_count + 128)
+        safe_max = min(estimated_tokens, max_new_tokens, 8192, 131072 - input_len - 100)
+        print(f"Generating audio for {len(text)} characters, {word_count} words")
+        print(f"Input tokens: {input_len}, Estimated: {estimated_tokens}, Max new tokens: {safe_max}")
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
