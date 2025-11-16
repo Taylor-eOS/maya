@@ -1,25 +1,235 @@
 import os
 import torch
 import numpy as np
-from pysbd import Segmenter
-from maya import AudioGenerator
 import soundfile as sf
+import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from snac import SNAC
+from pysbd import Segmenter
 
-speaker_description = "A steady male voice reading a history audiobook, pitched in the comfortable mid range around 150 hertz, with a gentle warmth from soft rounded vowels and even breath support, carrying a faint neutral European inflection like a calm professor from Copenhagen, speaking at a measured 140 words per minute, rising slightly for emphasis on key ideas but never rushing, and holding brief natural pauses only at the end of complete sentences to let thoughts settle before the next, content and happy to share."
-fixed_seed = 42
-pause_duration = 0.4
-max_new_tokens = 8192
-sample_rate = 24000
-pause_length = int(pause_duration * sample_rate)
-pause_silence = np.zeros(pause_length, dtype=np.float32)
-fade_duration = 0.05
-fade_length = int(fade_duration * sample_rate)
-output_dir = "."
-input_file = "input.txt"
-max_words_per_chunk = 80
-os.makedirs(output_dir, exist_ok=True)
-gen = AudioGenerator()
-segmenter = Segmenter(language="en", clean=False)
+TEMPERATURE = 0.2
+TOP_P = 0.95
+REPETITION_PENALTY = 1.0
+CODE_START_TOKEN_ID = 128257
+CODE_END_TOKEN_ID = 128258
+CODE_TOKEN_OFFSET = 128266
+SNAC_MIN_ID = 128266
+SNAC_MAX_ID = 156937
+SNAC_TOKENS_PER_FRAME = 7
+SOH_ID = 128259
+EOH_ID = 128260
+SOA_ID = 128261
+BOS_ID = 128000
+TEXT_EOT_ID = 128009
+DEFAULT_WPM = 140
+SAMPLE_RATE = 24000
+SAMPLES_PER_FRAME = 2048
+
+class AudioGenerator:
+    def __init__(self, device=None, verbose=True):
+        self.device = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+        self.verbose = verbose
+        if self.verbose:
+            print(f"Using device: {self.device}")
+        self.model = AutoModelForCausalLM.from_pretrained("maya-research/maya1", torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained("maya-research/maya1", trust_remote_code=True)
+        try:
+            self.snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
+            if torch.cuda.is_available():
+                self.snac_model = self.snac_model.to(self.device)
+        except Exception as e:
+            print("Error loading SNAC model:", e)
+            raise
+
+    def build_prompt(self, description, text):
+        soh_token = self.tokenizer.decode([SOH_ID])
+        eoh_token = self.tokenizer.decode([EOH_ID])
+        soa_token = self.tokenizer.decode([SOA_ID])
+        sos_token = self.tokenizer.decode([CODE_START_TOKEN_ID])
+        eot_token = self.tokenizer.decode([TEXT_EOT_ID])
+        bos_token = self.tokenizer.bos_token or ""
+        formatted_text = f'<description="{description}"> {text}'
+        return soh_token + bos_token + formatted_text + eot_token + eoh_token + soa_token + sos_token
+
+    def extract_snac_codes(self, token_ids):
+        try:
+            eos_idx = token_ids.index(CODE_END_TOKEN_ID)
+        except ValueError:
+            eos_idx = len(token_ids)
+        snac_region = token_ids[:eos_idx]
+        snac_codes = [tid for tid in snac_region if SNAC_MIN_ID <= tid <= SNAC_MAX_ID]
+        if self.verbose:
+            print("SNAC extraction diagnostics:", {
+                "full_generated_len": len(token_ids),
+                "region_len": len(snac_region),
+                "snac_count": len(snac_codes),
+                "preview_region": snac_region[:120],
+                "preview_snac": snac_codes[:120]
+            })
+        return snac_codes
+
+    def unpack_snac(self, snac_tokens, tokens_per_frame=SNAC_TOKENS_PER_FRAME):
+        if not snac_tokens:
+            return [[], [], []]
+        try:
+            cfg = getattr(self.snac_model, "config", None)
+            if cfg is not None:
+                if hasattr(cfg, "tokens_per_frame"):
+                    tokens_per_frame = cfg.tokens_per_frame
+                if hasattr(cfg, "code_offset"):
+                    global CODE_TOKEN_OFFSET
+                    CODE_TOKEN_OFFSET = cfg.code_offset
+        except Exception:
+            pass
+        total = len(snac_tokens)
+        rem = total % tokens_per_frame
+        if rem != 0:
+            if self.verbose:
+                print(f"Warning: SNAC token count {total} not divisible by tokens_per_frame {tokens_per_frame}, truncating last {rem} tokens.")
+            snac_tokens = snac_tokens[:total - rem]
+            total = len(snac_tokens)
+        frames = len(snac_tokens) // tokens_per_frame
+        if self.verbose:
+            print(f"Tokens per frame used: {tokens_per_frame}, frames: {frames}")
+        if frames == 0:
+            return [[], [], []]
+        l1 = []
+        l2 = []
+        l3 = []
+        for i in range(frames):
+            slots = snac_tokens[i * tokens_per_frame:(i + 1) * tokens_per_frame]
+            if tokens_per_frame == 7:
+                l1.append((slots[0] - CODE_TOKEN_OFFSET) % 4096)
+                l2.extend([(slots[1] - CODE_TOKEN_OFFSET) % 4096, (slots[4] - CODE_TOKEN_OFFSET) % 4096])
+                l3.extend([(slots[2] - CODE_TOKEN_OFFSET) % 4096, (slots[3] - CODE_TOKEN_OFFSET) % 4096, (slots[5] - CODE_TOKEN_OFFSET) % 4096, (slots[6] - CODE_TOKEN_OFFSET) % 4096])
+            else:
+                l1.append((slots[0] - CODE_TOKEN_OFFSET) % 4096)
+                if len(slots) >= 3:
+                    l2.extend([(slots[1] - CODE_TOKEN_OFFSET) % 4096, (slots[2] - CODE_TOKEN_OFFSET) % 4096])
+                for s in slots[3:]:
+                    l3.append((s - CODE_TOKEN_OFFSET) % 4096)
+        if self.verbose:
+            print(f"Level lengths: l1={len(l1)}, l2={len(l2)}, l3={len(l3)}")
+        return [l1, l2, l3]
+
+    def trim_leading_silence_rms(self, audio, sr=SAMPLE_RATE, win_ms=10, threshold_db=-45.0, prepad=0.02):
+        win = int(sr * (win_ms / 1000.0))
+        if win < 1:
+            win = 1
+        pad = int(sr * prepad)
+        if len(audio) <= win:
+            return audio[pad:]
+        try:
+            framed = np.lib.stride_tricks.sliding_window_view(np.abs(audio), win)
+            rms = np.sqrt(np.mean(framed ** 2, axis=1))
+            rms_db = 20 * np.log10(np.maximum(rms, 1e-12))
+            idx = np.where(rms_db > threshold_db)[0]
+            if idx.size == 0:
+                return audio[pad:]
+            first = max(0, idx[0] - pad)
+            return audio[first:]
+        except Exception:
+            abs_thresh = np.max(np.abs(audio)) * 0.01
+            start_idx = np.where(np.abs(audio) > abs_thresh)[0]
+            if start_idx.size == 0:
+                return audio[pad:]
+            start_idx = max(0, start_idx[0] - pad)
+            return audio[start_idx:]
+
+    def trim_trailing_silence_rms(self, audio, sr=SAMPLE_RATE, win_ms=10, threshold_db=-45.0, postpad=0.02):
+        win = int(sr * (win_ms / 1000.0))
+        if win < 1:
+            win = 1
+        pad = int(sr * postpad)
+        if len(audio) <= win:
+            return audio[:-pad] if len(audio) > pad else audio
+        try:
+            framed = np.lib.stride_tricks.sliding_window_view(np.abs(audio), win)
+            rms = np.sqrt(np.mean(framed ** 2, axis=1))
+            rms_db = 20 * np.log10(np.maximum(rms, 1e-12))
+            idx = np.where(rms_db > threshold_db)[0]
+            if idx.size == 0:
+                return audio[:-pad] if len(audio) > pad else audio
+            last = min(len(rms_db) - 1, idx[-1] + pad // max(1, win))
+            end_idx = min(len(audio), (last * 1) + win)
+            return audio[:end_idx]
+        except Exception:
+            return audio
+
+    def generate_audio(self, text, speaker_description, max_new_tokens=16384, wpm=DEFAULT_WPM, seconds_per_word_override=None):
+        start_time = time.time()
+        word_count = len(text.split())
+        if seconds_per_word_override is None:
+            seconds_per_word = 60.0 / float(max(1, wpm))
+        else:
+            seconds_per_word = seconds_per_word_override
+        estimated_tokens = 30 * word_count + 128
+        prompt = self.build_prompt(speaker_description, text)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        input_len = inputs['input_ids'].shape[1]
+        safe_max = min(estimated_tokens, max_new_tokens, 8192, 131072 - input_len - 100)
+        if self.verbose:
+            print(f"Generating audio for {len(text)} characters, {word_count} words")
+            print(f"Input tokens: {input_len}, Estimated tokens: {estimated_tokens}, Max new tokens: {safe_max}")
+        with torch.inference_mode():
+            outputs = self.model.generate(**inputs, max_new_tokens=safe_max, min_new_tokens=0, temperature=TEMPERATURE, top_p=TOP_P, repetition_penalty=REPETITION_PENALTY, do_sample=True, eos_token_id=CODE_END_TOKEN_ID, pad_token_id=self.tokenizer.pad_token_id)
+        generated_ids = outputs[0, input_len:].tolist()
+        if self.verbose:
+            print(f"Generated raw ids length: {len(generated_ids)}. First 160 ids: {generated_ids[:160]}")
+        snac_tokens = self.extract_snac_codes(generated_ids)
+        if self.verbose:
+            print(f"Generated {len(snac_tokens)} SNAC tokens")
+        if len(snac_tokens) < 7:
+            raise ValueError(f"Not enough SNAC tokens generated for audio: {len(snac_tokens)}")
+        tokens_per_frame = SNAC_TOKENS_PER_FRAME
+        try:
+            cfg = getattr(self.snac_model, "config", None)
+            if cfg is not None and hasattr(cfg, "tokens_per_frame"):
+                tokens_per_frame = cfg.tokens_per_frame
+        except Exception:
+            pass
+        max_seconds = max(1.0, word_count * seconds_per_word)
+        max_frames = max(1, int((max_seconds * SAMPLE_RATE) / SAMPLES_PER_FRAME))
+        possible_frames = len(snac_tokens) // tokens_per_frame
+        if possible_frames > max_frames:
+            truncate_tokens = max_frames * tokens_per_frame
+            if self.verbose:
+                print(f"Truncating SNAC tokens to {truncate_tokens} ({max_frames} frames) to limit decoded duration ~{max_seconds:.1f}s")
+            snac_tokens = snac_tokens[:truncate_tokens]
+        levels = self.unpack_snac(snac_tokens, tokens_per_frame=tokens_per_frame)
+        codes_tensor = [torch.tensor(level, dtype=torch.long, device=self.device).unsqueeze(0) for level in levels]
+        if self.verbose:
+            for i, t in enumerate(codes_tensor):
+                try:
+                    print(f"codes_tensor[{i}].shape dtype:{t.dtype} min/max:{int(t.min())}/{int(t.max())} len:{t.shape}")
+                except Exception:
+                    print(f"codes_tensor[{i}] inspection failed")
+        codes_tensor = [ct.long().to(self.device) for ct in codes_tensor]
+        with torch.inference_mode():
+            z_q = self.snac_model.quantizer.from_codes(codes_tensor)
+            audio = self.snac_model.decoder(z_q)[0, 0].cpu().numpy()
+        audio = self.trim_leading_silence_rms(audio, sr=SAMPLE_RATE, win_ms=10, threshold_db=-45.0, prepad=0.02)
+        audio = self.trim_trailing_silence_rms(audio, sr=SAMPLE_RATE, win_ms=10, threshold_db=-45.0, postpad=0.02)
+        if len(audio) > 2048:
+            audio_abs = np.abs(audio)
+            threshold = np.max(audio_abs) * 0.01
+            start_idx = np.where(audio_abs > threshold)[0]
+            if len(start_idx) > 0:
+                start_idx = max(0, start_idx[0] - 512)
+                audio = audio[start_idx:]
+            else:
+                audio = audio[2048:]
+        elapsed_time = time.time() - start_time
+        time_per_word = elapsed_time / word_count if word_count > 0 else 0
+        if self.verbose:
+            print(f"Generated audio length: {len(audio)} samples ({len(audio) / SAMPLE_RATE:.2f} seconds)")
+        print(f"Generation time: {elapsed_time:.2f}s for {word_count} words ({time_per_word:.3f}s per word)")
+        return audio
+
+    def save_audio(self, audio, output_file, sample_rate=SAMPLE_RATE):
+        sf.write(output_file, audio, sample_rate)
 
 def split_text_into_chunks(text, max_words=80, segmenter=None):
     sentences = segmenter.segment(text)
@@ -34,7 +244,7 @@ def split_text_into_chunks(text, max_words=80, segmenter=None):
             i = 0
             while i < len(words):
                 take = min(max_words, len(words) - i)
-                sub = " ".join(words[i:i+take])
+                sub = " ".join(words[i:i + take])
                 chunks.append(sub)
                 i += take
     return chunks
@@ -50,6 +260,22 @@ def apply_fade(audio, fade_length):
     return faded
 
 def main():
+    speaker_description = "A British male in the 40s reading a history book without accent, calm and professional, pronouncing clearly, and holding natural pauses only at logical breaks."
+    fixed_seed = 42
+    pause_duration = 0.4
+    max_new_tokens = 8192
+    sample_rate = SAMPLE_RATE
+    fade_duration = 0.05
+    output_dir = "."
+    input_file = "input.txt"
+    max_words_per_chunk = 80
+    verbose = False
+    pause_length = int(pause_duration * sample_rate)
+    pause_silence = np.zeros(pause_length, dtype=np.float32)
+    fade_length = int(fade_duration * sample_rate)
+    os.makedirs(output_dir, exist_ok=True)
+    gen = AudioGenerator(verbose=verbose)
+    segmenter = Segmenter(language="en", clean=False)
     with open(input_file, "r", encoding="utf-8") as f:
         full_text = f.read()
     sections = [section.strip() for section in full_text.split("\n\n") if section.strip()]
@@ -62,14 +288,14 @@ def main():
         print(f"Split into {len(chunks)} chunks")
         audio_segments = []
         for idx, chunk in enumerate(chunks):
-            print(f"Generating chunk {idx+1}/{len(chunks)}: {len(chunk.split())} words")
+            print(f"Generating chunk {idx + 1}/{len(chunks)}: {len(chunk.split())} words")
             torch.manual_seed(fixed_seed)
             try:
-                audio = gen.generate_audio(chunk, speaker_description, max_new_tokens)
+                audio = gen.generate_audio(chunk, speaker_description, max_new_tokens=max_new_tokens, wpm=DEFAULT_WPM)
                 faded_audio = apply_fade(audio, fade_length)
                 audio_segments.append(faded_audio)
             except Exception as e:
-                print(f"Error generating audio for chunk {idx+1}: {e}")
+                print(f"Error generating audio for chunk {idx + 1}: {e}")
         if audio_segments:
             paused_segments = [audio_segments[0]]
             for seg in audio_segments[1:]:
