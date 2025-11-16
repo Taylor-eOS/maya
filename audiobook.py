@@ -45,13 +45,11 @@ def process_text_file(input_file, speaker_description):
         print(f"Duration: {len(combined_audio)/24000:.2f} seconds")
         print(f"Chapter processing time: {chapter_time:.2f}s")
     if debug_data:
-        print("\n=== DEBUG DATA ===")
         for line in debug_data:
             print(line)
         total_ratios = [float(line.split('ratio=')[1]) for line in debug_data]
         avg_ratio = sum(total_ratios) / len(total_ratios)
-        print(f"\nOverall average tokens per character: {avg_ratio:.2f}")
-        print("Debug data printed to console (no file saved)")
+        print(f"Overall average tokens per character: {avg_ratio:.2f}")
 
 if __name__ == "__main__":
     process_text_file("input.txt", speaker_description)
