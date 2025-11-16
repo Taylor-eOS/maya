@@ -3,11 +3,12 @@ import numpy as np
 import time
 from maya import AudioGenerator
 
-speaker_description = "British audiobook narrator, male, late 40s, without accent, reading a nonfiction book professionally, pronouncing clearly, holding pauses only at natural logical breaks."
+speaker_description = "British audiobook narrator, male, late 40s, without accent, reading a nonfiction book professionally, pronouncing clearly, holding pauses only at natural logical breaks, serious conservative."
 
 def process_text_file(input_file, speaker_description):
     generator = AudioGenerator()
     segmenter = pysbd.Segmenter(language="en", clean=False)
+    debug_data = []
     with open(input_file, 'r', encoding='utf-8') as f:
         text = f.read()
     chapters = text.split('\n\n')
@@ -20,20 +21,37 @@ def process_text_file(input_file, speaker_description):
         sentences = [s.strip() for s in sentences if s.strip()]
         print(f"Processing {len(sentences)} sentences")
         audio_segments = []
-        for i, sentence in enumerate(sentences, 1):
+        sentence_idx = 1
+        for sentence in sentences:
+            if not sentence:
+                continue
             sentence_start = time.time()
-            print(f"\nSentence {i}/{len(sentences)}: {sentence[:50]}...")
-            audio = generator.generate_audio(sentence, speaker_description)
+            print(f"Sentence {sentence_idx}/{len(sentences)}: {sentence[:50]}...")
+            audio, snac_tokens = generator.generate_audio(sentence, speaker_description)
             audio_segments.append(audio)
+            char_count = len(sentence)
+            snac_count = len(snac_tokens)
+            ratio = snac_count / char_count if char_count > 0 else 0
+            print(f"Characters: {char_count}, SNAC tokens: {snac_count}, Ratio: {ratio:.2f}")
+            debug_data.append(f"Chapter {chapter_idx}, Sentence {sentence_idx}: chars={char_count}, snac={snac_count}, ratio={ratio:.2f}")
+            sentence_idx += 1
             sentence_time = time.time() - sentence_start
             print(f"Time: {sentence_time:.2f}s")
         combined_audio = np.concatenate(audio_segments)
         output_file = f"output_chapter_{chapter_idx:03d}.wav"
         generator.save_audio(combined_audio, output_file)
         chapter_time = time.time() - chapter_start
-        print(f"\nSaved chapter {chapter_idx} to {output_file}")
+        print(f"Saved chapter {chapter_idx} to {output_file}")
         print(f"Duration: {len(combined_audio)/24000:.2f} seconds")
         print(f"Chapter processing time: {chapter_time:.2f}s")
+    if debug_data:
+        print("\n=== DEBUG DATA ===")
+        for line in debug_data:
+            print(line)
+        total_ratios = [float(line.split('ratio=')[1]) for line in debug_data]
+        avg_ratio = sum(total_ratios) / len(total_ratios)
+        print(f"\nOverall average tokens per character: {avg_ratio:.2f}")
+        print("Debug data printed to console (no file saved)")
 
 if __name__ == "__main__":
     process_text_file("input.txt", speaker_description)

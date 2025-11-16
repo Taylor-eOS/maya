@@ -3,21 +3,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from snac import SNAC
 import soundfile as sf
 import numpy as np
+from ids import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, CODE_TOKEN_OFFSET, SNAC_MIN_ID, SNAC_MAX_ID, SNAC_TOKENS_PER_FRAME, SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID
 
 TEMPERATURE = 0.1
 TOP_P = 1.0
 REPETITION_PENALTY = 1.0
-CODE_START_TOKEN_ID = 128257
-CODE_END_TOKEN_ID = 128258
-CODE_TOKEN_OFFSET = 128266
-SNAC_MIN_ID = 128266
-SNAC_MAX_ID = 156937
-SNAC_TOKENS_PER_FRAME = 7
-SOH_ID = 128259
-EOH_ID = 128260
-SOA_ID = 128261
-BOS_ID = 128000
-TEXT_EOT_ID = 128009
 
 class AudioGenerator:
     def __init__(self):
@@ -88,10 +78,10 @@ class AudioGenerator:
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_len = inputs['input_ids'].shape[1]
-        word_count = len(text.split())
-        estimated_tokens = int(1.5 * 30 * word_count + 128)
+        char_count = len(text)
+        estimated_tokens = int(22 * char_count + 128)
         safe_max = min(estimated_tokens, max_new_tokens, 8192, 131072 - input_len - 100)
-        print(f"Generating audio for {len(text)} characters, {word_count} words")
+        print(f"Generating audio for {char_count} characters")
         print(f"Input tokens: {input_len}, Estimated: {estimated_tokens}, Max new tokens: {safe_max}")
         with torch.inference_mode():
             outputs = self.model.generate(
@@ -129,7 +119,7 @@ class AudioGenerator:
             end_idx = min(len(audio) - 1, end_idx[-1] + 512)
             audio = audio[:end_idx + 1]
         print(f"Generated audio length: {len(audio)} samples ({len(audio)/24000:.2f} seconds)")
-        return audio
+        return audio, snac_tokens
 
     def save_audio(self, audio, output_file, sample_rate=24000):
         sf.write(output_file, audio, sample_rate)
