@@ -3,7 +3,7 @@ import numpy as np
 import time
 from maya import AudioGenerator
 
-speaker_description = "A professional male audiobook narrator in his late forties with a deep, resonant, and slightly husky voice, speaking clearly in a calm and measured tone."
+speaker_description = "A professional male audiobook narrator in his late forties with a deep, resonant, and slightly husky voice, speaking clearly in a calm, measured, and engaged tone."
 
 def process_text_file(input_file, speaker_description):
     generator = AudioGenerator()
@@ -26,7 +26,7 @@ def process_text_file(input_file, speaker_description):
             if not sentence:
                 continue
             sentence_start = time.time()
-            print(f"Sentence {sentence_idx}/{len(sentences)}: {sentence[:40]}...")
+            print(f"Sentence {sentence_idx}/{len(sentences)}: \"{sentence}\"")
             audio, snac_tokens = generator.generate_audio(sentence, speaker_description)
             audio_segments.append(audio)
             char_count = len(sentence)

@@ -1,17 +1,28 @@
-import math
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 from snac import SNAC
 import soundfile as sf
 import numpy as np
 import pysbd
-from ids import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, CODE_TOKEN_OFFSET, SNAC_MIN_ID, SNAC_MAX_ID, SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID
+from ids import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, CODE_TOKEN_OFFSET, SNAC_MIN_ID, SNAC_MAX_ID, SOH_ID, EOH_ID, SOA_ID, TEXT_EOT_ID
 
-TEMPERATURE = 0.1
-TOP_P = 1.0
-REPETITION_PENALTY = 1.0
+TEMPERATURE = 0.7
+TOP_P = 0.95
+REPETITION_PENALTY = 1.2
 SNAC_TOKENS_PER_FRAME = 7
-TOKEN_PER_CHAR = 28
+
+class CallbackStoppingCriteria(StoppingCriteria):
+    def __init__(self, callback):
+        self.callback = callback
+    def __call__(self, input_ids, scores, **kwargs):
+        last_token = input_ids[0, -1].item()
+        return self.callback(last_token)
+
+class MaxTokensStoppingCriteria(StoppingCriteria):
+    def __init__(self, max_total_tokens):
+        self.max_total_tokens = max_total_tokens
+    def __call__(self, input_ids, scores, **kwargs):
+        return input_ids.shape[1] >= self.max_total_tokens
 
 class AudioGenerator:
     def __init__(self, model_name="maya-research/maya1", snac_name="hubertsiuzdak/snac_24khz"):
@@ -23,83 +34,78 @@ class AudioGenerator:
             self.snac_model = self.snac_model.to(self.device)
         self.segmenter = pysbd.Segmenter(language="en", clean=False)
 
-    def build_prompt(self,description,text):
-        soh_token=self.tokenizer.decode([SOH_ID])
-        eoh_token=self.tokenizer.decode([EOH_ID])
-        soa_token=self.tokenizer.decode([SOA_ID])
-        sos_token=self.tokenizer.decode([CODE_START_TOKEN_ID])
-        eot_token=self.tokenizer.decode([TEXT_EOT_ID])
-        bos_token=self.tokenizer.bos_token
-        formatted_text=f'<description="{description}"> {text}'
-        prompt=soh_token+bos_token+formatted_text+eot_token+eoh_token+soa_token+sos_token
+    def build_prompt(self, description, text):
+        soh_token = self.tokenizer.decode([SOH_ID])
+        eoh_token = self.tokenizer.decode([EOH_ID])
+        soa_token = self.tokenizer.decode([SOA_ID])
+        sos_token = self.tokenizer.decode([CODE_START_TOKEN_ID])
+        eot_token = self.tokenizer.decode([TEXT_EOT_ID])
+        bos_token = self.tokenizer.bos_token
+        formatted_text = f'<description="{description}"> {text}'
+        prompt = soh_token + bos_token + formatted_text + eot_token + eoh_token + soa_token + sos_token
         return prompt
 
-    def extract_snac_codes(self,token_ids):
+    def extract_snac_codes(self, token_ids):
         try:
-            eos_idx=token_ids.index(CODE_END_TOKEN_ID)
+            eos_idx = token_ids.index(CODE_END_TOKEN_ID)
         except ValueError:
-            eos_idx=len(token_ids)
-        snac_codes=[tid for tid in token_ids[:eos_idx] if SNAC_MIN_ID<=tid<=SNAC_MAX_ID]
+            eos_idx = len(token_ids)
+        snac_codes = [tid for tid in token_ids[:eos_idx] if SNAC_MIN_ID <= tid <= SNAC_MAX_ID]
         return snac_codes
 
-    def unpack_snac_from_7(self,snac_tokens):
+    def unpack_snac_from_7(self, snac_tokens):
         if not snac_tokens:
-            return [[],[],[]]
-        if snac_tokens and snac_tokens[-1]==CODE_END_TOKEN_ID:
-            snac_tokens=snac_tokens[:-1]
-        frames=len(snac_tokens)//SNAC_TOKENS_PER_FRAME
-        snac_tokens=snac_tokens[:frames*SNAC_TOKENS_PER_FRAME]
-        if frames==0:
-            return [[],[],[]]
-        l1,l2,l3=[],[],[]
+            return [[], [], []]
+        if snac_tokens and snac_tokens[-1] == CODE_END_TOKEN_ID:
+            snac_tokens = snac_tokens[:-1]
+        frames = len(snac_tokens) // SNAC_TOKENS_PER_FRAME
+        snac_tokens = snac_tokens[:frames * SNAC_TOKENS_PER_FRAME]
+        if frames == 0:
+            return [[], [], []]
+        l1, l2, l3 = [], [], []
         for i in range(frames):
-            slots=snac_tokens[i*7:(i+1)*7]
-            l1.append((slots[0]-CODE_TOKEN_OFFSET)%4096)
-            l2.extend([(slots[1]-CODE_TOKEN_OFFSET)%4096,(slots[4]-CODE_TOKEN_OFFSET)%4096])
+            slots = snac_tokens[i * 7:(i + 1) * 7]
+            l1.append((slots[0] - CODE_TOKEN_OFFSET) % 4096)
+            l2.extend([(slots[1] - CODE_TOKEN_OFFSET) % 4096, (slots[4] - CODE_TOKEN_OFFSET) % 4096])
             l3.extend([
-                (slots[2]-CODE_TOKEN_OFFSET)%4096,
-                (slots[3]-CODE_TOKEN_OFFSET)%4096,
-                (slots[5]-CODE_TOKEN_OFFSET)%4096,
-                (slots[6]-CODE_TOKEN_OFFSET)%4096,
+                (slots[2] - CODE_TOKEN_OFFSET) % 4096,
+                (slots[3] - CODE_TOKEN_OFFSET) % 4096,
+                (slots[5] - CODE_TOKEN_OFFSET) % 4096,
+                (slots[6] - CODE_TOKEN_OFFSET) % 4096,
             ])
-        return [l1,l2,l3]
+        return [l1, l2, l3]
 
-    def estimate_token_count_with_tokenizer(self,text):
-        return len(self.tokenizer(text).input_ids)
-
-    def generate_audio(self, text, speaker_description, temperature=0.9, top_p=0.95, repetition_penalty=1.0):
+    def generate_audio(self, text, speaker_description, temperature=TEMPERATURE, top_p=TOP_P, repetition_penalty=REPETITION_PENALTY):
         prompt = self.build_prompt(speaker_description, text)
         inputs = self.tokenizer(prompt, return_tensors="pt")
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        input_len = inputs['input_ids'].shape[1]
+        input_len = inputs["input_ids"].shape[1]
+        max_audio_tokens = 8192
         consecutive_silence_frames = 0
-        needed_silence_frames = 8
         generated_tokens = []
         def stop_callback(new_token_id):
             nonlocal consecutive_silence_frames, generated_tokens
             generated_tokens.append(new_token_id)
-            if new_token_id == self.tokenizer.pad_token_id:
+            if new_token_id == CODE_END_TOKEN_ID:
                 return True
             if not (SNAC_MIN_ID <= new_token_id <= SNAC_MAX_ID):
                 return False
-            recent = generated_tokens[-7:]
-            if len(recent) != 7:
+            if len(generated_tokens) < SNAC_TOKENS_PER_FRAME:
                 return False
-            codes = [t - CODE_TOKEN_OFFSET for t in recent]
-            first = codes[0]
-            rest = codes[1:]
-            if first in (2052, 2053) and all(x == first for x in rest):
+            recent_frame = generated_tokens[-SNAC_TOKENS_PER_FRAME:]
+            coarse_code = (recent_frame[0] - CODE_TOKEN_OFFSET) % 4096
+            if coarse_code >= 2048:
                 consecutive_silence_frames += 1
             else:
                 consecutive_silence_frames = 0
-            if consecutive_silence_frames >= needed_silence_frames:
+            if consecutive_silence_frames >= 7:
                 return True
             return False
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=32768,
+                max_new_tokens=max_audio_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
@@ -107,7 +113,8 @@ class AudioGenerator:
                 eos_token_id=CODE_END_TOKEN_ID,
                 pad_token_id=self.tokenizer.pad_token_id,
                 stopping_criteria=StoppingCriteriaList([
-                    CallbackStoppingCriteria(stop_callback)
+                    CallbackStoppingCriteria(stop_callback),
+                    MaxTokensStoppingCriteria(input_len + max_audio_tokens)
                 ])
             )
         generated_ids = outputs[0, input_len:].tolist()
@@ -122,34 +129,25 @@ class AudioGenerator:
         audio_abs = np.abs(audio)
         threshold = np.max(audio_abs) * 0.01 if audio_abs.size > 0 else 0
         if len(audio) > 2048:
-            start_idx = np.where(audio_abs > threshold)[0]
+            start_idx = np.where(audio_abs[2048:] > threshold)[0]
             if len(start_idx) > 0:
-                start_idx = max(0, start_idx[0] - 512)
+                start_idx = 2048 + start_idx[0] - 512
+                start_idx = max(0, start_idx)
                 audio = audio[start_idx:]
-            else:
-                audio = audio[2048:]
         end_idx = np.where(audio_abs > threshold)[0]
         if len(end_idx) > 0:
-            end_idx = min(len(audio) - 1, end_idx[-1] + 512)
+            end_idx = end_idx[-1] + 512
             audio = audio[:end_idx + 1]
         return audio, snac_tokens
 
-    def save_audio(self,audio,output_file,sample_rate=24000):
-        sf.write(output_file,audio,sample_rate)
-
-class CallbackStoppingCriteria(StoppingCriteria):
-    def __init__(self, callback):
-        self.callback = callback
-
-    def __call__(self, input_ids, scores, **kwargs):
-        last_token = input_ids[0, -1].item()
-        return self.callback(last_token)
+    def save_audio(self, audio, output_file, sample_rate=24000):
+        sf.write(output_file, audio, sample_rate)
 
 if __name__ == "__main__":
     generator = AudioGenerator()
     text = "Frodo and Sam walk to Mordor to return the ring."
     speaker_description = "Professional british male audiobook narrator."
-    audio = generator.generate_audio(text, speaker_description)
-    generator.save_audio(audio, "output.wav")
+    audio, tokens = generator.generate_audio(text, speaker_description)
+    generator.save_audio(audio[0], "output.wav")
     print("Audio saved to output.wav")
 
