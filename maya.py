@@ -1,15 +1,16 @@
 import math
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 from snac import SNAC
 import soundfile as sf
 import numpy as np
 import pysbd
-from ids import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, CODE_TOKEN_OFFSET, SNAC_MIN_ID, SNAC_MAX_ID, SNAC_TOKENS_PER_FRAME, SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID
+from ids import CODE_START_TOKEN_ID, CODE_END_TOKEN_ID, CODE_TOKEN_OFFSET, SNAC_MIN_ID, SNAC_MAX_ID, SOH_ID, EOH_ID, SOA_ID, BOS_ID, TEXT_EOT_ID
 
 TEMPERATURE = 0.1
 TOP_P = 1.0
 REPETITION_PENALTY = 1.0
+SNAC_TOKENS_PER_FRAME = 7
 TOKEN_PER_CHAR = 28
 
 class AudioGenerator:
@@ -66,78 +67,82 @@ class AudioGenerator:
     def estimate_token_count_with_tokenizer(self,text):
         return len(self.tokenizer(text).input_ids)
 
-    def generate_audio(self,text,speaker_description,max_new_tokens_hardcap=32768,temperature=0.9,top_p=0.95,repetition_penalty=1.0):
-        prompt=self.build_prompt(speaker_description,text)
-        inputs=self.tokenizer(prompt,return_tensors="pt")
+    def generate_audio(self, text, speaker_description, temperature=0.9, top_p=0.95, repetition_penalty=1.0):
+        prompt = self.build_prompt(speaker_description, text)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
         if torch.cuda.is_available():
-            inputs={k:v.to(self.device) for k,v in inputs.items()}
-        input_len=inputs['input_ids'].shape[1]
-        model_pos=getattr(self.model.config,"max_position_embeddings",131072)
-        safety_margin=512
-        available_new_tokens=max(0,model_pos-input_len-safety_margin)
-        if available_new_tokens<64:
-            raise ValueError(f"Prompt too long for model context window (input_len={input_len}, model_pos={model_pos})")
-        caps=[]
-        for c in (4096,8192,16384,max_new_tokens_hardcap,available_new_tokens):
-            c=min(c,available_new_tokens)
-            if c>0:
-                caps.append(c)
-        caps=sorted(set(caps))
-        generated_snac=None
-        generated_audio=None
-        last_debug=None
-        for cap in caps:
-            cap=int(cap)
-            with torch.inference_mode():
-                try:
-                    outputs=self.model.generate(**inputs,max_new_tokens=cap,temperature=temperature,top_p=top_p,repetition_penalty=repetition_penalty,do_sample=True,eos_token_id=CODE_END_TOKEN_ID,pad_token_id=self.tokenizer.pad_token_id)
-                except Exception as e:
-                    last_debug=f"generation error at cap={cap}: {e}"
-                    continue
-            generated_ids=outputs[0,input_len:].tolist()
-            snac_tokens=self.extract_snac_codes(generated_ids)
-            if len(snac_tokens)>=SNAC_TOKENS_PER_FRAME:
-                generated_snac=snac_tokens
-                break
-            with torch.inference_mode():
-                try:
-                    outputs_greedy=self.model.generate(**inputs,max_new_tokens=cap,temperature=0.0,top_p=1.0,do_sample=False,eos_token_id=CODE_END_TOKEN_ID,pad_token_id=self.tokenizer.pad_token_id)
-                except Exception as e:
-                    last_debug=f"greedy generation error at cap={cap}: {e}"
-                    continue
-            generated_ids=outputs_greedy[0,input_len:].tolist()
-            snac_tokens=self.extract_snac_codes(generated_ids)
-            if len(snac_tokens)>=SNAC_TOKENS_PER_FRAME:
-                generated_snac=snac_tokens
-                break
-            last_debug=f"cap={cap} produced snac_len={len(snac_tokens)}"
-        if generated_snac is None:
-            raise ValueError(f"Failed to generate valid SNAC tokens. Last debug: {last_debug}")
-        if len(generated_snac)<7:
-            raise ValueError(f"Not enough SNAC tokens generated for audio: {len(generated_snac)}")
-        levels=self.unpack_snac_from_7(generated_snac)
-        codes_tensor=[torch.tensor(level,dtype=torch.long,device=self.device).unsqueeze(0) for level in levels]
-        with torch.inference_mode():
-            z_q=self.snac_model.quantizer.from_codes(codes_tensor)
-            audio=self.snac_model.decoder(z_q)[0,0].cpu().numpy()
-        audio_abs=np.abs(audio)
-        threshold=np.max(audio_abs)*0.01 if audio_abs.size>0 else 0
-        if len(audio)>2048:
-            start_idx=np.where(audio_abs>threshold)[0]
-            if len(start_idx)>0:
-                start_idx=max(0,start_idx[0]-512)
-                audio=audio[start_idx:]
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        input_len = inputs['input_ids'].shape[1]
+        SILENCE_PATTERN = [2052, 2053, 2053, 2053, 2053, 2053, 2053]
+        consecutive_silence_frames = 0
+        needed_silence_frames = 8
+        generated_tokens = []
+        def stop_callback(new_token_id):
+            nonlocal consecutive_silence_frames, generated_tokens
+            generated_tokens.append(new_token_id)
+            if new_token_id == self.tokenizer.pad_token_id:
+                return True
+            if not (SNAC_MIN_ID <= new_token_id <= SNAC_MAX_ID):
+                return False
+            recent = generated_tokens[-7:]
+            if len(recent) != 7:
+                return False
+            recent_codes = [t - CODE_TOKEN_OFFSET for t in recent]
+            if recent_codes == SILENCE_PATTERN:
+                consecutive_silence_frames += 1
             else:
-                audio=audio[2048:]
-        end_idx=np.where(audio_abs>threshold)[0]
-        if len(end_idx)>0:
-            end_idx=min(len(audio)-1,end_idx[-1]+512)
-            audio=audio[:end_idx+1]
-        return audio,generated_snac
+                consecutive_silence_frames = 0
+            if consecutive_silence_frames >= needed_silence_frames:
+                return True
+            return False
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=32768,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                do_sample=True,
+                eos_token_id=CODE_END_TOKEN_ID,
+                pad_token_id=self.tokenizer.pad_token_id,
+                stopping_criteria=StoppingCriteriaList([
+                    CallbackStoppingCriteria(stop_callback)
+                ])
+            )
+        generated_ids = outputs[0, input_len:].tolist()
+        snac_tokens = self.extract_snac_codes(generated_ids)
+        if len(snac_tokens) < SNAC_TOKENS_PER_FRAME:
+            raise ValueError("Model generated almost no audio codes")
+        levels = self.unpack_snac_from_7(snac_tokens)
+        codes_tensor = [torch.tensor(level, dtype=torch.long, device=self.device).unsqueeze(0) for level in levels]
+        with torch.inference_mode():
+            z_q = self.snac_model.quantizer.from_codes(codes_tensor)
+            audio = self.snac_model.decoder(z_q)[0, 0].cpu().numpy()
+        audio_abs = np.abs(audio)
+        threshold = np.max(audio_abs) * 0.01 if audio_abs.size > 0 else 0
+        if len(audio) > 2048:
+            start_idx = np.where(audio_abs > threshold)[0]
+            if len(start_idx) > 0:
+                start_idx = max(0, start_idx[0] - 512)
+                audio = audio[start_idx:]
+            else:
+                audio = audio[2048:]
+        end_idx = np.where(audio_abs > threshold)[0]
+        if len(end_idx) > 0:
+            end_idx = min(len(audio) - 1, end_idx[-1] + 512)
+            audio = audio[:end_idx + 1]
+        return audio, snac_tokens
 
     def save_audio(self,audio,output_file,sample_rate=24000):
         sf.write(output_file,audio,sample_rate)
 
+class CallbackStoppingCriteria(StoppingCriteria):
+    def __init__(self, callback):
+        self.callback = callback
+
+    def __call__(self, input_ids, scores, **kwargs):
+        last_token = input_ids[0, -1].item()
+        return self.callback(last_token)
 
 if __name__ == "__main__":
     generator = AudioGenerator()
