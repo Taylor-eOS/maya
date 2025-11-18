@@ -73,7 +73,6 @@ class AudioGenerator:
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_len = inputs['input_ids'].shape[1]
-        SILENCE_PATTERN = [2052, 2053, 2053, 2053, 2053, 2053, 2053]
         consecutive_silence_frames = 0
         needed_silence_frames = 8
         generated_tokens = []
@@ -87,8 +86,10 @@ class AudioGenerator:
             recent = generated_tokens[-7:]
             if len(recent) != 7:
                 return False
-            recent_codes = [t - CODE_TOKEN_OFFSET for t in recent]
-            if recent_codes == SILENCE_PATTERN:
+            codes = [t - CODE_TOKEN_OFFSET for t in recent]
+            first = codes[0]
+            rest = codes[1:]
+            if first in (2052, 2053) and all(x == first for x in rest):
                 consecutive_silence_frames += 1
             else:
                 consecutive_silence_frames = 0
