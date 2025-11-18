@@ -3,7 +3,7 @@ import numpy as np
 import time
 from maya import AudioGenerator
 
-speaker_description = "A British male without accent who is a professional audiobook narrator in his late forties with a deep, resonant voice, speaking clearly in a calm, measured, and engaged tone."
+speaker_description = "male voice, british rp, no accent, age 48, calm and engaged, narration style"
 
 def process_text_file(input_file, speaker_description):
     generator = AudioGenerator()

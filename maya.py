@@ -81,7 +81,7 @@ class AudioGenerator:
         if torch.cuda.is_available():
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[1]
-        max_audio_tokens = 12288
+        max_audio_tokens = 16384
         consecutive_silence_frames = 0
         generated_tokens = []
         def stop_callback(new_token_id):
@@ -93,15 +93,12 @@ class AudioGenerator:
                 return False
             if len(generated_tokens) % SNAC_TOKENS_PER_FRAME != 0:
                 return False
-            recent_frame = generated_tokens[-SNAC_TOKENS_PER_FRAME:]
-            coarse_code = (recent_frame[0] - CODE_TOKEN_OFFSET) % 4096
-            fine_codes = [(t - CODE_TOKEN_OFFSET) % 4096 for t in recent_frame[1:]]
-            is_silence = coarse_code >= 2048 and all(c < 100 for c in fine_codes)
-            if is_silence:
+            coarse_code = (generated_tokens[-SNAC_TOKENS_PER_FRAME] - CODE_TOKEN_OFFSET) % 4096
+            if coarse_code >= 2048:
                 consecutive_silence_frames += 1
             else:
                 consecutive_silence_frames = 0
-            if consecutive_silence_frames >= 12:
+            if consecutive_silence_frames >= 10:
                 return True
             return False
         with torch.inference_mode():
