@@ -3,7 +3,7 @@ import numpy as np
 import time
 from maya import AudioGenerator
 
-speaker_description = "A professional male audiobook narrator in his late forties with a deep, resonant, and slightly husky voice, speaking clearly in a calm, measured, and engaged tone."
+speaker_description = "A British male without accent who is a professional audiobook narrator in his late forties with a deep, resonant voice, speaking clearly in a calm, measured, and engaged tone."
 
 def process_text_file(input_file, speaker_description):
     generator = AudioGenerator()
@@ -36,7 +36,7 @@ def process_text_file(input_file, speaker_description):
             debug_data.append(f"Chapter {chapter_idx}, Sentence {sentence_idx}: chars={char_count}, snac={snac_count}, ratio={ratio:.2f}")
             sentence_idx += 1
             sentence_time = time.time() - sentence_start
-            print(f"Time: {sentence_time:.2f}s")
+            print(f"Time: {sentence_time:.0f}s, {sentence_time/char_count:.1f}char/s")
         combined_audio = np.concatenate(audio_segments)
         output_file = f"output_chapter_{chapter_idx:03d}.wav"
         generator.save_audio(combined_audio, output_file)
