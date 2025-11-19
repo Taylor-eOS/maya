@@ -4,4 +4,4 @@ numpy
 snac
 soundfile
 accelerate
-pydub
+pysbd
